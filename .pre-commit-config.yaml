@@ -1,0 +1,24 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.5.0
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.10.0
+    hooks:
+      - id: mypy
+        files: ^evalforge/
+        additional_dependencies:
+          - pydantic>=2.7
+          - structlog>=24.1
+          - types-setuptools
+  - repo: local
+    hooks:
+      - id: import-linter
+        name: import-linter
+        entry: lint-imports
+        language: system
+        pass_filenames: false
+        files: ^evalforge/
