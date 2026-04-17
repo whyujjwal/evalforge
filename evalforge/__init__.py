@@ -20,6 +20,8 @@ from evalforge.errors import (
 )
 from evalforge.events import EventBus
 from evalforge.pipeline import Suite, compile_pipeline
+from evalforge.storage import Storage
+from evalforge.storage.sqlite import SQLiteStorage
 from evalforge.types import (
     AgentContext,
     AgentKind,
@@ -63,7 +65,9 @@ __all__ = [
     "Run",
     "RunConfig",
     "RunStatus",
+    "SQLiteStorage",
     "Score",
+    "Storage",
     "Suite",
     "Task",
     "TaskResult",

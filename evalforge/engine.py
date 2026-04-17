@@ -137,6 +137,7 @@ class Engine:
                     "task_count": len(suite.tasks),
                     "pending_count": len(pending),
                     "resumed": resume_from is not None,
+                    "run": run.model_dump(mode="json"),
                 },
             )
         )
@@ -191,6 +192,8 @@ class Engine:
                     "failed": len([r for r in results if r.status is TaskStatus.FAILED]),
                     "total_tokens": final.total_tokens.total_tokens,
                     "mean_scores": final.mean_score_per_rubric,
+                    "finished_at": final.finished_at.isoformat() if final.finished_at else None,
+                    "error": error,
                 },
             )
         )
@@ -264,6 +267,10 @@ class Engine:
                     "error": failed_msg,
                     "scores": {s.rubric_name: s.value for s in scores},
                     "tokens": tokens_acc.total_tokens,
+                    # Full result so a subscriber can persist state from the
+                    # stream alone. Serialized as JSON-compatible dict so the
+                    # event can be logged, shipped over SSE, etc.
+                    "result": result.model_dump(mode="json"),
                 },
             )
         )

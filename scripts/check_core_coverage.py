@@ -11,14 +11,14 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 CORE_FILES = {
-    "evalforge/types.py",
-    "evalforge/errors.py",
-    "evalforge/pipeline.py",
-    "evalforge/engine.py",
-    "evalforge/events.py",
-    "evalforge/agents.py",
-    "evalforge/storage/__init__.py",
-    "evalforge/storage/sqlite.py",
+    "types.py",
+    "errors.py",
+    "pipeline.py",
+    "engine.py",
+    "events.py",
+    "agents.py",
+    "storage/__init__.py",
+    "storage/sqlite.py",
 }
 
 FLOOR_PERCENT = 90.0

@@ -82,5 +82,39 @@ Real-time narrative of how this library was built in one session. Each milestone
 
 **Gates:** ruff ✅, mypy --strict ✅, import-linter ✅, pytest ✅ (38 passed).
 
-**What's next:** M3 — SQLite storage, migrations, and the fault-injection resume test (kill the engine mid-run; verify no task is double-scored, nothing dropped, final results identical to a clean run on the same seed).
+**What's next:** M3 — SQLite storage, migrations, and the fault-injection resume test.
+
+---
+
+## M3 — SQLite storage, migrations, resumability
+
+**Built:**
+
+- `evalforge/storage/__init__.py` — `Storage` Protocol. Narrow surface: `initialize`, `save_run`, `save_task_result`, `load_run`, `completed_task_ids`, `list_runs`, `attach(bus)`. `attach` returns an async context manager.
+- `evalforge/storage/sqlite.py` — stdlib `sqlite3` in WAL mode, wrapped in `anyio.to_thread.run_sync`. One connection behind a single `anyio.Lock`: for our workload (one writer, many reads) a pool is worse than correct. `save_task_result` writes the row plus its scores in a single `BEGIN IMMEDIATE ... COMMIT` block — partial writes are impossible by construction. Events are audit-logged into an `events` table; duplicate `(run_id, seq)` on idempotent replay is a no-op (caught `IntegrityError`).
+- `evalforge/storage/migrations/001_initial.sql` — schema with `schema_version` table. `_migrate_sync` applies any file whose numeric prefix exceeds the current max version. Future migrations are a new numbered `.sql` file; no migration tool needed.
+- Engine update: `task_finished` and `run_started` events now carry the full serialized `TaskResult` / `Run` in their payload. This is what lets storage be a pure subscriber — it derives everything it needs from the event stream.
+
+**Key decisions:**
+
+1. *Engine ↔ storage coupling.* Per the spec: "Storage is a subscriber, not a dependency of the engine." I enforced that literally — `engine.py` imports nothing from `storage/`. The event payload carries enough to rebuild state. The consequence: you must attach storage as a subscriber (`async with storage.attach(bus)`) before running the engine, otherwise nothing is persisted. Acceptable cost for the architectural cleanliness.
+2. *Connection management.* Options were: one connection + lock (chosen), one connection per call, connection pool, aiosqlite dependency. One-connection-with-lock is simplest and correct: SQLite with WAL allows concurrent readers even with a single writer, and our writer is serialized anyway (it's the event subscriber, single-consumer). Adding `aiosqlite` buys nothing we don't already have.
+3. *Transaction boundary.* `save_task_result` opens a `BEGIN IMMEDIATE` transaction, writes the `task_results` row (ON CONFLICT UPDATE), deletes any stale scores for that task, inserts fresh scores, and commits. Using `DELETE + INSERT` for scores — rather than a UNIQUE constraint + UPSERT per row — makes replay idempotent for the "same task re-emitted" case without per-row conflict handling. One transaction.
+4. *Bus-close contract for `attach`.* The drain task exits on `EndOfStream`, which only fires when the bus is closed. I initially had `attach`'s `__aexit__` call `stream.aclose()`, but that discards buffered events. I went back and forth: the clean design is that callers close the bus *inside* the `attach` context, which triggers `EndOfStream` on the subscriber, which drains the rest. I documented this as a caller contract. As a safety net, `attach`'s exit will close the bus itself if the caller forgot. This took a bit of back-and-forth to get right.
+5. *Resume algorithm.* `Engine.run(suite, resume_from=Run)` reads `completed_task_ids` off the `Run` (which is populated from storage by `load_run`), filters `pending = [t for t in suite.tasks if t.id not in completed]`, and proceeds. Because storage persists each `TaskResult` transactionally on `task_finished`, the set of "ok" tasks on disk is always a prefix of what the engine committed — meaning resume never double-scores.
+
+**Recovery moments:**
+
+- The first fault-injection test run surfaced an ordering bug: tests were calling `bus.close()` *after* exiting `storage.attach`, but the drain task was already canceled at that point, so `run_finished` and late `task_finished` events never made it to disk. The test panicked with `RunStatus.RUNNING` when we expected `COMPLETED`. This is exactly the kind of bug the fault-injection test is designed to catch — the contract wasn't obvious, and now it's explicit. Fixed by closing the bus *inside* the `attach` context and documenting.
+- A `ClosedResourceError` leaked from the drain task when the context exited abruptly. Added `anyio.ClosedResourceError` to the drain's `except` tuple.
+
+**Test surface (3 new integration tests, 41 total):**
+
+- `test_storage_roundtrip` — run → persist → reload → equality on status, task ids, and scores.
+- `test_resume_skips_completed_and_matches_clean_run` — **the key M3 test.** Run 8 tasks with concurrency=2 and latency; trigger `stop_event` mid-run so only some complete; verify partial state persisted as `CANCELLED`; resume from the partial run; assert (1) no task scored twice, (2) all 8 tasks present, (3) resumed scores equal a fresh clean run's scores per-task.
+- `test_resume_on_already_complete_run_is_no_op` — resume a fully-complete run; no new work, same `run.id`, same tasks.
+
+**Gates:** ruff ✅, mypy --strict ✅, import-linter ✅ (30 files, 81 deps, 0 broken), pytest ✅ (41 passed). Coverage on core modules: **92.33%** (floor 90%).
+
+**What's next:** M4 — real provider adapters (Anthropic, OpenAI) translating SDK exceptions to our taxonomy, plus the secret-redaction test. After that, M5 (CLI + server) and M6 (end-to-end example) are thin wrappers on top.
 

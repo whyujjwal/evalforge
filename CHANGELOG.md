@@ -33,3 +33,12 @@ v0.1.0 onward.
   `TransientError` with seeded exponential-backoff + jitter; graceful
   shutdown via an `anyio.Event` stop signal; emits structured events for
   every state transition so storage/CLI/metrics are simple subscribers.
+- `Storage` protocol + `SQLiteStorage` (stdlib sqlite3 in WAL mode,
+  wrapped by `anyio.to_thread`). Migrations run on `initialize()` from
+  `evalforge/storage/migrations/*.sql`. `storage.attach(bus)` spawns a
+  subscriber that persists run headers and full `TaskResult`s in a single
+  transaction per task.
+- Resume: `Engine.run(suite, resume_from=Run)` skips tasks already
+  persisted as `ok`; fault-injection test verifies no double-scoring,
+  no dropped tasks, and deterministic parity with a clean run under the
+  same seed.
