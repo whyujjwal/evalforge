@@ -42,3 +42,11 @@ v0.1.0 onward.
   persisted as `ok`; fault-injection test verifies no double-scoring,
   no dropped tasks, and deterministic parity with a clean run under the
   same seed.
+- Real provider adapters: `AnthropicProvider` (Messages API) and
+  `OpenAIProvider` (Chat Completions) built directly on `httpx` — no
+  vendor SDK dependency. Both translate HTTP errors at the boundary
+  (429 / 5xx / network → `ProviderTransientError`; 4xx → `ProviderPermanentError`)
+  and populate `TokenUsage.cost_usd` from a pluggable pricing table.
+- Structured logging via `structlog` with a `redact_secrets` processor
+  that scrubs known API keys (including in nested dicts / lists) before
+  records are encoded.
