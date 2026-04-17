@@ -67,10 +67,12 @@ ignore = [
     "E501",  # handled by formatter
     "B008",  # allow function calls in defaults (typer)
     "UP007", # keep Optional[...] where it's clearer
+    "A002",  # `id` is a natural arg name for nodes; shadowing `id()` is fine
+    "A005",  # `evalforge.types` intentionally shadows stdlib `types`
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["A002", "N802", "N803", "N806"]
+"tests/**" = ["A002", "N802", "N803", "N806", "B017"]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -135,6 +137,7 @@ exclude_lines = [
 
 [tool.importlinter]
 root_package = "evalforge"
+include_external_packages = true
 
 [[tool.importlinter.contracts]]
 name = "Layered architecture"
