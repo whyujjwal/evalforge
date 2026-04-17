@@ -7,6 +7,7 @@ Anything under ``evalforge.*`` not re-exported here is private and may change.
 from __future__ import annotations
 
 from evalforge.agents import Agent, Judge, llm_agent, llm_judge, rule_judge
+from evalforge.engine import Engine, EngineResult
 from evalforge.errors import (
     ConfigurationError,
     EvalforgeError,
@@ -17,6 +18,7 @@ from evalforge.errors import (
     ProviderTransientError,
     TransientError,
 )
+from evalforge.events import EventBus
 from evalforge.pipeline import Suite, compile_pipeline
 from evalforge.types import (
     AgentContext,
@@ -46,8 +48,11 @@ __all__ = [
     "CompletionRequest",
     "CompletionResponse",
     "ConfigurationError",
+    "Engine",
+    "EngineResult",
     "EvalforgeError",
     "Event",
+    "EventBus",
     "FatalError",
     "Judge",
     "PermanentError",

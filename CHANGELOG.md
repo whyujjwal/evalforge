@@ -25,3 +25,11 @@ v0.1.0 onward.
   offloaded to a threadpool.
 - `compile_pipeline` + `Suite`: nested-list pipeline declarations compile
   eagerly into a validated `ResolvedDAG`.
+- `EventBus`: in-process multi-subscriber async pub/sub with monotonic seq
+  and per-subscriber back-pressure (bounded memory object streams).
+- `MockProvider`: deterministic, seedable provider for tests; accepts a
+  scripted list of responses, exceptions, or callables.
+- `Engine`: task-level bounded-concurrency executor; per-node retry on
+  `TransientError` with seeded exponential-backoff + jitter; graceful
+  shutdown via an `anyio.Event` stop signal; emits structured events for
+  every state transition so storage/CLI/metrics are simple subscribers.
