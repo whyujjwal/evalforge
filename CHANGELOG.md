@@ -5,7 +5,13 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) from
 v0.1.0 onward.
 
-## [Unreleased]
+## [0.1.0] - 2026-04-17
+
+Initial release. Library is feature-complete for the milestones laid out
+in the project spec: declarative suites, DAG pipelines, async execution
+engine with bounded concurrency and per-node retries, SQLite persistence
+with resume, real Anthropic/OpenAI adapters, structured logging with
+secret redaction, a Typer CLI, and a FastAPI server.
 
 ### Added
 

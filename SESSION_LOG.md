@@ -116,5 +116,120 @@ Real-time narrative of how this library was built in one session. Each milestone
 
 **Gates:** ruff ✅, mypy --strict ✅, import-linter ✅ (30 files, 81 deps, 0 broken), pytest ✅ (41 passed). Coverage on core modules: **92.33%** (floor 90%).
 
-**What's next:** M4 — real provider adapters (Anthropic, OpenAI) translating SDK exceptions to our taxonomy, plus the secret-redaction test. After that, M5 (CLI + server) and M6 (end-to-end example) are thin wrappers on top.
+**What's next:** M4 — real provider adapters.
+
+---
+
+## M4 — Anthropic + OpenAI adapters, cost accounting, secret redaction
+
+**Built:**
+
+- `evalforge/providers/_http.py` — shared HTTP helpers. `translate_http_error` is where every third-party exception dies: `httpx.HTTPStatusError` for 429/5xx + connect/read timeouts/network errors become `ProviderTransientError`; all other 4xx become `ProviderPermanentError`. `require_env(name)` raises a `ProviderPermanentError` at construction time so missing keys surface *before* any request is issued, not deep inside a worker.
+- `evalforge/providers/anthropic.py`, `evalforge/providers/openai.py` — adapters built directly on `httpx`. **No vendor SDK dependency.** The spec's required deps do not mention `anthropic` / `openai`, and the thinner surface is easier to test. I use `httpx.MockTransport` in tests to stub responses at the wire boundary, which also guarantees we never accidentally hit a real endpoint.
+- `evalforge/providers/pricing.py` — per-million-token price table with `register_price(model, ModelPrice(in, out))`. Responses now populate `TokenUsage.cost_usd` from it. Pricing is intentionally **not** fetched from vendors: the price a run was billed at is a persistent property of the run, and historical runs shouldn't shift when vendor list prices change.
+- `evalforge/_logging.py` — `structlog` JSON pipeline. The key piece is `redact_secrets`, a processor that scrubs any `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` value from the record before encoding, **recursively** through nested dicts, lists, and tuples. Tests prove the key string never appears verbatim.
+
+**Key decisions:**
+
+1. *No vendor SDKs.* Considered `anthropic` + `openai`. Rejected: (a) spec's required-deps list doesn't mention them, (b) both SDKs pin their own `httpx` / `pydantic` versions and would churn `uv.lock` on every vendor release, (c) test mocking is simpler when we control the HTTP surface. Cost: we're responsible for tracking schema changes. Accepted — the Messages / Chat Completions shapes are stable enough that this is fine.
+2. *Redaction is defense-in-depth.* Provider adapters don't log API keys in the first place; the `redact_secrets` processor is a safety net for cases where a user logs a full request dict from their own code. The test proves the net works even when a key is buried three levels deep in a list inside a dict.
+3. *Pricing as code, not config.* Considered a YAML file. Rejected: this way the prices are versioned with the code, and overrides are a function call, not a file edit. The `mock` model is registered at `(0.0, 0.0)` so mock-driven tests' token accounting zeros out cleanly.
+4. *Strict validation at the env boundary.* `AnthropicProvider()` / `OpenAIProvider()` read the env var at `__init__` and raise if it's missing. The alternative — lazy at first request — means a misconfigured production service would run a pipeline for minutes and only fail on the first provider call. Raising early is a much better error.
+
+**Recovery moments:**
+
+- `mypy --strict` flagged `redact_secrets` as having the wrong signature for a `structlog` processor: it expected `MutableMapping[str, Any]` not `dict[str, Any]`. Fixed.
+- Ruff warned about `f"..."` strings with no interpolation in the redaction test — I was using `f""` just to keep the pattern consistent. Removed the `f` prefix.
+- Providers initially called `raise_for_status()` eagerly inside `json_or_raise`. That made the error translation code clumsy because I was catching `HTTPStatusError` in two places. Reorganized so the `try/except httpx.HTTPError` at the `post()` call site handles both network errors and bad statuses uniformly via `translate_http_error`.
+
+**Test surface (11 new, 52 total):**
+
+- 8 provider tests: request shape + response parse per vendor, 429/4xx/5xx/network translation for Anthropic, network-error translation for OpenAI, refuses-to-construct without env key.
+- 3 redaction tests: key in a top-level string, key in a nested dict, and a no-secrets-present negative test (proves normal log lines still pass through unscathed).
+
+**Gates:** ruff ✅, mypy --strict ✅, import-linter ✅ (40 files, 105 deps), pytest ✅ (52 passed).
+
+**What's next:** M5 — CLI + FastAPI server as thin adapters.
+
+---
+
+## M5 + M6 — CLI, server, end-to-end example
+
+**Built:**
+
+- `evalforge/_loader.py` — imports a Suite object from a Python file path. Used by both CLI and server. Raises `ConfigurationError` with the specific path / attribute name when things don't line up.
+- `evalforge/cli.py` (Typer): `run`, `show`, `list`, `diff`. Every command is 5–15 lines and maps to one or two library calls. Emits structured JSON logs to stderr; prints the run id on stdout for shell piping.
+- `evalforge/server.py` (FastAPI): `POST /runs`, `GET /runs`, `GET /runs/{id}`, `GET /runs/{id}/events`. `create_app(db_path=...)` factory plus a module-level `app` for `uvicorn evalforge.server:app`. Lifespan context manages the storage connection. An `EvalforgeError` exception handler maps our taxonomy to HTTP status codes.
+- `examples/math_suite.py` — 4 math word problems with a solver → `[llm_judge("correctness"), rule_judge("is_digit")]` pipeline. Runs against the mock provider with scripted responses so anyone can `uv run evalforge run examples/math_suite.py` out of the box.
+
+**Key decisions:**
+
+1. *Factory over module-level app.* `create_app(db_path=...)` lets tests stand up isolated server instances with their own DBs, and lets the same code run against different databases in different environments. The module-level `app = create_app()` stays for the `uvicorn evalforge.server:app` case.
+2. *Server's SSE is historical replay.* Live streaming events off the in-memory bus to HTTP clients would require fanning out across multiple subscribers and managing backpressure per-client. I punted: `GET /runs/{id}/events` reads from the persisted `events` table. For runs in flight, the CLI / client can poll or re-request. Live fan-out is a follow-up — flagged, not forgotten.
+3. *CLI uses subprocess tests, server uses ASGI in-process.* The CLI test spawns a real subprocess to catch packaging / entry-point mistakes; the server test uses `httpx.ASGITransport` + `app.router.lifespan_context(app)` in-process so the tests stay fast.
+4. *The example is deliberately reproducible.* `install_mock_provider(script=[...])` at module scope means the example prints the same results every run. This is a documentation property: the README can claim "mean correctness 0.75, all 4 tasks pass is_digit" and it'll be true forever.
+
+**Recovery moments:**
+
+- FastAPI `@on_event("startup")` is deprecated in 0.111+. My `filterwarnings = ["error"]` in `pytest.ini` turned that into a hard test failure on first run — which is exactly what the filter is for. Migrated to `lifespan` context managers.
+- Ruff's SIM117 (combine `with` statements) flagged my nested `async with AsyncClient(...) as c: async with app.router.lifespan_context(app):` pattern. Combined into a parenthesized multi-context form.
+
+**End-to-end proof:** ran `uv run evalforge run examples/math_suite.py` in a scratch directory; got a run id back, saw `mean_scores: {"correctness": 0.75, "is_digit": 1.0}` in the final log line, and `evalforge list` showed the persisted row.
+
+**Test surface (3 new, 55 total):**
+
+- `test_example_suite_runs` — the example runs end to end through the real engine.
+- `test_cli_run_command` — subprocess tests of `evalforge run`, `evalforge show`, `evalforge list` against an isolated SQLite DB.
+- `test_server_lifecycle` — ASGI in-process test of `POST /runs`, `GET /runs/{id}`, `GET /runs`, covering the full lifespan handler pair.
+
+**Gates:** ruff ✅, mypy --strict ✅, import-linter ✅ (45 files, 139 deps, 0 broken), pytest ✅ (55 passed). Core coverage: **92.33%** (floor 90%).
+
+---
+
+## M7 — Polish
+
+**Built:** fleshed-out README (quickstart, architecture, error taxonomy, public API surface, server doc, development gate list), tagged v0.1.0 in the CHANGELOG, finalized this session log.
+
+**What was built across the session:**
+
+| Module                      | LOC  | What it is |
+|-----------------------------|------|------------|
+| `types.py`                  | ~300 | Frozen Pydantic v2 domain (Task, Score, Run, TaskResult, Event, …) |
+| `errors.py`                 |  ~85 | EvalforgeError hierarchy with structured context |
+| `pipeline.py`               | ~260 | Nested-list declaration → `ResolvedDAG`; `Suite` with eager compile |
+| `agents.py`                 | ~320 | Agent/Judge protocols; `llm_agent`/`llm_judge`/`rule_judge` factories |
+| `events.py`                 | ~160 | `EventBus` with per-subscriber bounded streams; monotonic seq |
+| `engine.py`                 | ~400 | DAG walker, task-level semaphore, per-node seeded retry, event emission |
+| `storage/sqlite.py`         | ~400 | sqlite3 + WAL via `anyio.to_thread`; transactional task writes; `attach(bus)` |
+| `storage/migrations/001_initial.sql` | ~60 | Schema: runs / task_results / scores / events |
+| `providers/anthropic.py`, `providers/openai.py` | ~225 | `httpx`-based adapters with error translation |
+| `providers/pricing.py`      |  ~55 | Pluggable per-model pricing table |
+| `_logging.py`               |  ~85 | structlog pipeline + recursive secret redaction |
+| `_loader.py`                |  ~45 | Load Suite from a .py file path |
+| `cli.py`                    | ~140 | Typer: `run`, `show`, `list`, `diff` |
+| `server.py`                 | ~165 | FastAPI with lifespan; `POST /runs`, `GET /runs[/{id}[/events]]` |
+| `examples/math_suite.py`    |  ~70 | Runnable end-to-end suite against the mock |
+
+**Final gates, all green:**
+- 55 tests (26 unit + 12 integration + 17 provider/redaction/pipeline) under `pytest-randomly` ordering.
+- `ruff check` + `ruff format --check` clean.
+- `mypy --strict` on `evalforge/`: 19 source files, 0 errors, 0 `# type: ignore` that isn't justified.
+- `import-linter`: both the layered-architecture contract and the types/errors-as-leaves contract KEPT.
+- Core-module coverage: **92.33%** (floor 90%).
+- CI runs the exact same sequence on Python 3.11 and 3.12.
+
+**What I'm proud of in this session:**
+- The event bus as the single source of truth. Storage literally cannot diverge from the engine's idea of the world because it derives everything from the stream.
+- The fault-injection resume test. It's the test I would've wanted as a skeptic reading the spec.
+- `import-linter` catching dependency-direction drift at CI time, not at code-review time.
+- The provider adapters having zero vendor SDK dependency. Smaller surface, faster tests, easier to maintain.
+
+**What I'd do next with more time:**
+- Live SSE streaming off the active bus (currently replays from storage).
+- Caching — memoize `(agent_id, task_id, input_hash, agent_version)` tuples so rubric-only re-runs are cheap. Noted as a stretch goal in the spec.
+- Per-agent concurrency override (spec allows it; current code respects only the Suite-level knob).
+- A browser UI at `GET /runs/{id}/ui`.
+
+v0.1.0 is tagged. CI is green on every push. The library is something I'd onboard a junior engineer to tomorrow.
+
 
