@@ -50,3 +50,10 @@ v0.1.0 onward.
 - Structured logging via `structlog` with a `redact_secrets` processor
   that scrubs known API keys (including in nested dicts / lists) before
   records are encoded.
+- `evalforge` CLI (Typer): `run`, `show`, `list`, `diff` — thin adapters
+  over the library.
+- FastAPI server: `POST /runs`, `GET /runs`, `GET /runs/{id}`,
+  `GET /runs/{id}/events` (SSE stream). `create_app(db_path=...)` factory
+  plus a module-level `app` for `uvicorn evalforge.server:app`.
+- `examples/math_suite.py`: runnable against the mock provider
+  (`uv run evalforge run examples/math_suite.py`).
