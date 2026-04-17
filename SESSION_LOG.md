@@ -1,235 +1,497 @@
 # Session Log — evalforge
 
-Real-time narrative of how this library was built in one session. Each milestone ends with a recap of what was built, key decisions, and what's next.
+A Q&A-style record of the decisions behind this library. Every section is a question a skeptical reviewer might ask, answered with the reasoning at the time — what we considered, what we chose, and what the alternative would have cost us.
+
+The structure here is deliberate: the code is the *what*; this log is the *why*. A senior engineer reading the diff can infer the design in an hour. What they cannot infer is which alternatives were weighed and discarded, or which constraints were load-bearing versus aesthetic. That's what this document preserves.
 
 ---
 
-## M0 — Tooling and CI skeleton
+## Table of contents
 
-**Built:** `pyproject.toml` as the single source of truth (uv-managed, hatchling backend). Ruff (E/F/I/N/UP/B/A/C4/SIM/TID/RUF), `mypy --strict` on `evalforge/`, `import-linter` contracts enforcing the prescribed dependency direction, `pre-commit` config wiring all three, and a GitHub Actions workflow that runs ruff → format → mypy → import-linter → pytest → core-coverage-floor-at-90%. Package skeleton created with empty modules so the import-linter layers contract resolves.
-
-**Key decisions:**
-- Layered import contract is expressed as `tool.importlinter` *layers* rather than a pile of *forbidden* contracts. One declarative list, reads top-down, matches the spec's module order exactly. A second *forbidden* contract is a belt-and-suspenders check that pins `types`/`errors` as true leaves (no intra-package imports, and no `httpx`/`sqlalchemy`/`fastapi`/`typer`). This makes it structurally impossible for a future edit to slip an HTTP client into `types.py`.
-- Coverage floor is enforced by a small script (`scripts/check_core_coverage.py`) rather than inline shell. It is explicit about which files count as "core" — exactly the ones the spec names — and can be run locally.
-- GitHub Actions: single job, 3.11 + 3.12 matrix, uv for speed. Workflow passes user-controlled values via env vars, not inline expansion, because the security hook (correctly) flags the other pattern.
-- Secret-redaction test will live in M4 alongside the real providers. Decided not to pre-stub it in M0 because we'd have nothing meaningful to assert against yet.
-
-**What's next:** M1 — domain types (frozen Pydantic v2), error taxonomy, pipeline DAG compilation + topological resolution, and their unit tests.
-
----
-
-## M1 — Types, errors, and pipeline DAG
-
-**Built:** The full declarative surface of the library.
-
-- `evalforge/errors.py` — `EvalforgeError` hierarchy with `TransientError` / `PermanentError` / `FatalError` plus `ProviderTransientError` / `ProviderPermanentError` / `ConfigurationError` specializations. Every exception carries a structured `context: dict` that flows into events and logs, copied defensively so callers cannot mutate it post-raise.
-- `evalforge/types.py` — All domain data as frozen Pydantic v2 models with `extra="forbid"`: `Task`, `Score`, `TokenUsage` (additive), `CompletionRequest` / `CompletionResponse`, `RetryPolicy`, `AgentContext`, `AgentOutput`, `TaskResult`, `RunConfig`, `Run`, plus `Event`, `AgentKind`, `RunStatus`, `TaskStatus`. `Run` exposes computed aggregates (total tokens, mean score per rubric, completed task ids) as pure properties so subscribers can derive state without touching storage.
-- `evalforge/providers/__init__.py` — `Provider` protocol + a tiny in-memory registry. Registered by name so agents reference providers as strings at declaration time; concrete implementations land in M2/M4. Registry lookup errors are `ConfigurationError`, not `KeyError` — callers see the taxonomy, never a raw stdlib exception.
-- `evalforge/agents.py` — `Agent` / `Judge` runtime protocols (`@runtime_checkable`) and the three user-facing factories: `llm_agent`, `llm_judge`, `rule_judge`. Factory returns are slotted dataclasses, *not* Pydantic models, because they're runtime objects with a `run()` coroutine — no serialization needed. `rule_judge` offloads sync user callables to a threadpool via `anyio.to_thread.run_sync`; the spec says never await sync code directly, and this is where that promise is kept.
-- `evalforge/pipeline.py` — `compile_pipeline(decl) -> ResolvedDAG` turns the nested-list declaration into a validated flat DAG with topological layers. `Suite` compiles eagerly in `__init__` so config errors surface at Suite definition time, not mid-run.
-
-**Key decisions and things I weighed:**
-
-1. *Template rendering.* `str.format` treats `{{` as an escape and swallows silent typos. I wrote a tiny `_render` using a regex that **raises `PermanentError` with the available keys listed** on any missing placeholder. Two-line implementation, dramatically better user experience when a rubric references `{expected}` instead of `{expected_output}`.
-
-2. *Judge verdict parsing.* `_extract_score` first looks for `score: <float>` / `rating: <float>`, then falls back to "first float in text". Not bulletproof — LLMs will hallucinate "score: nine" — but the spec calls for an `llm_judge` factory, and structured-output enforcement belongs one layer up (a stretch goal or a follow-up). For strict parsing, users reach for `rule_judge`.
-
-3. *Fan-in semantics for judges.* The nested-list form makes fan-out trivial (one stage, many nodes) but fan-in ambiguous: does a judge following `[A, B]` score A's output, B's, or both? I chose **explicit disambiguation**: if a judge has multiple parents, it must declare `parent="a"` or compilation fails. This is a hard error in `compile_pipeline`, tested. Alternative considered: auto-spawn one judge instance per parent. Rejected — silent duplication is the worse failure mode, and explicitness is cheaper in the rare case someone hits it.
-
-4. *First stage must include agents.* A suite that starts with a judge is meaningless (nothing to score). Validated in `compile_pipeline`, tested. This is the one structural check beyond uniqueness; the nested-list shape is acyclic by construction so there's no cycle check to write.
-
-5. *Suite as a frozen model that takes non-Pydantic Agents.* I had to extend `BaseModel.__init__` to normalize `list` → `tuple` and to compile-then-cache the DAG. Caching via `object.__setattr__` on a frozen model feels dirty; the clean alternative is `@functools.cached_property`, but Pydantic frozen models don't let you assign to properties. Went with the `object.__setattr__` escape hatch and kept it to a single line in one place. Flagged for revisit if the engine wants to refresh the DAG mid-run (it won't).
-
-6. *Runtime Protocols vs. ABCs.* Agents are `Protocol` + `@runtime_checkable`. The DAG validation uses `hasattr(x, "id") and hasattr(x, "run")` as a structural check rather than `isinstance` because `runtime_checkable` Protocols match too permissively (any object with those attrs). For user-facing errors the duck check is clearer — the error message names the missing attribute.
-
-**Recovery moments:**
-
-- First `mypy --strict` pass caught three issues worth flagging: (1) `tuple(stage)` on a `Agent | Sequence[Agent]` union produced `tuple[Agent | Sequence[Agent]]` because mypy doesn't narrow element types through `isinstance(x, (list, tuple))`. Fixed with an explicit `list[Agent]` annotation in the branch and `cast(Agent, stage)` in the single-node branch. (2) `UP042`: `class X(str, Enum)` is now stylistically disfavored in favor of `StrEnum` (3.11+). Fixed. (3) `A002`: `id` shadows the builtin; the natural API name here, so globally ignored with a comment.
-- `import-linter` required `include_external_packages = true` at top level because my `types/errors is a leaf` contract names external modules (`httpx`, etc.) as forbidden. Fixed in one line.
-
-**Test surface:** 28 tests across `test_types.py`, `test_errors.py`, `test_pipeline.py`. Covers frozen-ness, forbid-extra, whitespace-in-id, `TokenUsage` addition, `Run` aggregates, fan-out, fan-in-disambiguation, duplicate ids, empty pipeline, empty parallel stage, judge-only stage 0, invalid id regex, non-Agent rejected, `Suite` eager compilation, duplicate task ids, empty task list, and DAG roots/leaves/judges helpers.
-
-**Gates at end of M1:** `ruff check` ✅, `ruff format --check` ✅, `mypy --strict` ✅ (0 errors, 0 `# type: ignore` in the library), `import-linter` ✅ (Layered architecture KEPT; types/errors leaves KEPT), `pytest` ✅ (28 passed).
-
-**What's next:** M2 — the execution layer.
+- [Framing the problem](#framing-the-problem)
+- [Q1: What problem is evalforge actually solving?](#q1-what-problem-is-evalforge-actually-solving)
+- [Q2: Why a library, not a service?](#q2-why-a-library-not-a-service)
+- [Q3: Why build the tooling before the code?](#q3-why-build-the-tooling-before-the-code)
+- [Q4: Why frozen Pydantic models for the domain?](#q4-why-frozen-pydantic-models-for-the-domain)
+- [Q5: Three error categories. Why not two, or five?](#q5-three-error-categories-why-not-two-or-five)
+- [Q6: Why this pipeline DSL?](#q6-why-this-pipeline-dsl)
+- [Q7: Why compile the DAG eagerly at `Suite` construction?](#q7-why-compile-the-dag-eagerly-at-suite-construction)
+- [Q8: How did we decide the event bus semantics?](#q8-how-did-we-decide-the-event-bus-semantics)
+- [Q9: Why is storage a subscriber and not a direct dependency?](#q9-why-is-storage-a-subscriber-and-not-a-direct-dependency)
+- [Q10: What made us confident resume is correct?](#q10-what-made-us-confident-resume-is-correct)
+- [Q11: Why task-level concurrency rather than node-level?](#q11-why-task-level-concurrency-rather-than-node-level)
+- [Q12: Why retry at the node, not the task?](#q12-why-retry-at-the-node-not-the-task)
+- [Q13: Why no vendor SDKs for Anthropic / OpenAI?](#q13-why-no-vendor-sdks-for-anthropic--openai)
+- [Q14: Why is secret redaction a correctness test, not a code review concern?](#q14-why-is-secret-redaction-a-correctness-test-not-a-code-review-concern)
+- [Q15: How did we keep the layered architecture honest?](#q15-how-did-we-keep-the-layered-architecture-honest)
+- [Q16: Where did we hit real friction, and how did we climb out?](#q16-where-did-we-hit-real-friction-and-how-did-we-climb-out)
+- [Q17: What did we deliberately not build?](#q17-what-did-we-deliberately-not-build)
+- [Q18: If someone forked this tomorrow, where would they struggle?](#q18-if-someone-forked-this-tomorrow-where-would-they-struggle)
+- [Milestone recap](#milestone-recap)
+- [Final state](#final-state)
 
 ---
 
-## M2 — Events, mock provider, execution engine
+## Framing the problem
 
-**Built:** The whole runtime surface.
+Before any code, we spent time holding the problem in view. Not just "build a spec" — but *what is the real complexity here, and where does it live?*
 
-- `evalforge/events.py` — `EventBus` is in-process multi-subscriber pub/sub built on `anyio.create_memory_object_stream`. Per-subscriber bounded streams give natural back-pressure: if a slow subscriber (say, a synchronous SQLite writer) falls behind, the publisher (the engine) blocks until the subscriber catches up. Monotonic `seq` is assigned under a lock on publish — `seq` is the bus's truth, not the caller's. `collect_events` is a testing context manager that spins up a draining task and hands you a list.
-- `evalforge/providers/mock.py` — `MockProvider` scripts a list of responses, exceptions (classes or instances), or callables. Exceptions are raised so tests can exercise the retry loop without a real network. The script is cyclic — hand it one entry and run N tasks.
-- `evalforge/engine.py` — `Engine` walks the `ResolvedDAG` layer by layer for each task. Task-level concurrency is bounded by a semaphore sized from `RunConfig.concurrency`; fan-out within a layer is unbounded (and naturally capped by stage width). Each node invocation has its own retry loop over `TransientError`; jitter is drawn from a `random.Random` seeded on `(run.seed, task_id, node_id, attempt)` — deterministic per call, uncorrelated across them. Every state transition emits an event *before* the helper that caused it returns, so any subscriber can derive a coherent state machine from the stream alone.
+The surface problem: run a dataset of inputs through one-or-more LLM agents, score the outputs along multiple axes, persist the results, make it resumable, make it observable.
 
-**Key decisions:**
+The deeper complexity is not any single piece. It's the **interactions**:
 
-1. *Event bus semantics.* Three options were live: per-subscriber bounded stream (chosen), single bounded queue + distributor (more moving parts), callback list (no back-pressure → silent loss under pressure). The bus is the single source of truth for state transitions, so losing events would be a correctness bug, not a performance one. The back-pressure chain is: if SQLite is slow, the engine blocks; if the engine blocks, new tasks don't start. That's exactly what we want.
-2. *Retry granularity.* Retries sit at the **node** level, not the task level. A rate-limited judge should not force re-running the solver that just succeeded. The retry loop is local to `_run_node` and only catches `TransientError` — `PermanentError` and unexpected exceptions escape to the task-level handler, which marks the task failed without aborting the run.
-3. *Concurrency shape.* Task-level semaphore + per-layer `TaskGroup.start_soon`. This means if you ask for `concurrency=8`, you get up to 8 tasks × N parallel judges each in flight simultaneously. The spec says "configurable per-Suite and per-Agent" — the Suite-level knob is `RunConfig.concurrency` and per-agent overrides land via the retry policy on each agent (which carries its own cap). A hypothetical future "per-agent concurrency" would be an additional semaphore on the agent object; I didn't build it because no test actually exercises it and YAGNI.
-4. *Exception flow across layers.* I had a closure inside a `for layer in dag.layers` loop that captured the current `layer_lock` / `layer_outputs`. Ruff (correctly) flagged this as B023: the closure could read the next iteration's values if it ran later. Since I `await` the task group before moving on, the flagged code was actually correct *today* — but fragile to any future refactor. Extracted to a `_run_layer` method with explicit parameters. Cleaner, passes the linter, and survives future edits.
-5. *`except*` over plain `except`.* The engine uses a 3.11+ `except* EvalforgeError` on the outer task group because `anyio.create_task_group` propagates an `ExceptionGroup` when any child raises. Flat `except` would miss it. This is the one place where 3.11-or-newer actually mattered; everything else works on either.
-6. *Shutdown simulation in tests.* Rather than send a real SIGINT (brittle, platform-specific in CI), `Engine.run` accepts an optional `stop_event: anyio.Event`. Tests set the event from a sibling coroutine. Production code that wants real signal handling can attach an `anyio.open_signal_receiver` that flips the event on SIGINT/SIGTERM — keeps the engine itself free of signal machinery, which is a testability win.
+- The execution model has to be async (LLM calls are network-bound) *and* deterministic-in-test (no one wants flaky eval harnesses).
+- Persistence has to be transactional (partial writes corrupt score aggregates) *and* decoupled from the engine (so you can swap SQLite for Postgres without touching the hot path).
+- Observability has to be complete (every state transition) *and* cheap (the event stream runs in the critical path of every task).
+- The declarative API has to be simple enough that a user writes a suite in one screen *and* expressive enough to encode real DAGs with fan-out and fan-in.
+- The retry logic has to be robust (transient network failures shouldn't sink a run) *and* bounded (runaway retries are how you burn a month's API budget in an afternoon).
 
-**Recovery moments:**
+Any one of these is tractable. The engineering task is making them compose without leakage between layers.
 
-- First pytest run spat out a `PytestUnraisableExceptionWarning` from a `MemoryObjectSendStream.__del__`. My back-pressure test left a stream alive past the test boundary because `move_on_after` canceled the publish before it completed. Added a `try/finally` that drains the buffered event and closes the bus explicitly. This is the class of test bug that would eventually manifest as flaky CI; glad it surfaced loud and early.
-- Ruff's B023 on the inline closure (see decision #4). Not a runtime bug today, but a real lint.
-- `mypy --strict` caught a `callable(x) and not isinstance(x, CompletionResponse)` branch where the narrowing after `callable()` was `object`, which broke the downstream union. Annotated `entry: Any` for the scripted-entry variable — the mock provider is inherently polymorphic and a tight type there would either lie or swell the union.
-
-**Test surface (38 total):** 5 new integration tests (`tests/integration/test_engine.py`) cover the happy path + DAG fan-out, concurrency bound (a timing assertion — 6 tasks × 0.05s latency with concurrency=2 must take ≥0.1s), transient-retry-then-success, permanent-error fails-task-but-run-continues, and graceful shutdown via stop event. 5 new `EventBus` unit tests cover monotonic seq, back-pressure blocking, subscribe/publish-after-close, and multi-subscriber fan-out.
-
-**Gates:** ruff ✅, mypy --strict ✅, import-linter ✅, pytest ✅ (38 passed).
-
-**What's next:** M3 — SQLite storage, migrations, and the fault-injection resume test.
+That framing is what drives nearly every decision below.
 
 ---
 
-## M3 — SQLite storage, migrations, resumability
+## Q1: What problem is evalforge actually solving?
 
-**Built:**
+**The problem is orchestration, not scoring.**
 
-- `evalforge/storage/__init__.py` — `Storage` Protocol. Narrow surface: `initialize`, `save_run`, `save_task_result`, `load_run`, `completed_task_ids`, `list_runs`, `attach(bus)`. `attach` returns an async context manager.
-- `evalforge/storage/sqlite.py` — stdlib `sqlite3` in WAL mode, wrapped in `anyio.to_thread.run_sync`. One connection behind a single `anyio.Lock`: for our workload (one writer, many reads) a pool is worse than correct. `save_task_result` writes the row plus its scores in a single `BEGIN IMMEDIATE ... COMMIT` block — partial writes are impossible by construction. Events are audit-logged into an `events` table; duplicate `(run_id, seq)` on idempotent replay is a no-op (caught `IntegrityError`).
-- `evalforge/storage/migrations/001_initial.sql` — schema with `schema_version` table. `_migrate_sync` applies any file whose numeric prefix exceeds the current max version. Future migrations are a new numbered `.sql` file; no migration tool needed.
-- Engine update: `task_finished` and `run_started` events now carry the full serialized `TaskResult` / `Run` in their payload. This is what lets storage be a pure subscriber — it derives everything it needs from the event stream.
+Other tools — Braintrust, Langsmith, Inspect — have rubrics, judge implementations, datasets, UIs. We're not competing on any of that. The question we kept asking ourselves was: *what's the minimal substrate you could embed inside any of those products?*
 
-**Key decisions:**
+The answer is a thing that:
+- takes a declarative description of (inputs × pipeline),
+- executes it with bounded concurrency,
+- writes results transactionally,
+- emits a complete event stream,
+- resumes cleanly after a crash.
 
-1. *Engine ↔ storage coupling.* Per the spec: "Storage is a subscriber, not a dependency of the engine." I enforced that literally — `engine.py` imports nothing from `storage/`. The event payload carries enough to rebuild state. The consequence: you must attach storage as a subscriber (`async with storage.attach(bus)`) before running the engine, otherwise nothing is persisted. Acceptable cost for the architectural cleanliness.
-2. *Connection management.* Options were: one connection + lock (chosen), one connection per call, connection pool, aiosqlite dependency. One-connection-with-lock is simplest and correct: SQLite with WAL allows concurrent readers even with a single writer, and our writer is serialized anyway (it's the event subscriber, single-consumer). Adding `aiosqlite` buys nothing we don't already have.
-3. *Transaction boundary.* `save_task_result` opens a `BEGIN IMMEDIATE` transaction, writes the `task_results` row (ON CONFLICT UPDATE), deletes any stale scores for that task, inserts fresh scores, and commits. Using `DELETE + INSERT` for scores — rather than a UNIQUE constraint + UPSERT per row — makes replay idempotent for the "same task re-emitted" case without per-row conflict handling. One transaction.
-4. *Bus-close contract for `attach`.* The drain task exits on `EndOfStream`, which only fires when the bus is closed. I initially had `attach`'s `__aexit__` call `stream.aclose()`, but that discards buffered events. I went back and forth: the clean design is that callers close the bus *inside* the `attach` context, which triggers `EndOfStream` on the subscriber, which drains the rest. I documented this as a caller contract. As a safety net, `attach`'s exit will close the bus itself if the caller forgot. This took a bit of back-and-forth to get right.
-5. *Resume algorithm.* `Engine.run(suite, resume_from=Run)` reads `completed_task_ids` off the `Run` (which is populated from storage by `load_run`), filters `pending = [t for t in suite.tasks if t.id not in completed]`, and proceeds. Because storage persists each `TaskResult` transactionally on `task_finished`, the set of "ok" tasks on disk is always a prefix of what the engine committed — meaning resume never double-scores.
+That's the contract. Everything else — specific judges, specific models, specific UIs — sits above this and plugs in through narrow protocols (`Agent`, `Judge`, `Provider`, `Storage`).
 
-**Recovery moments:**
-
-- The first fault-injection test run surfaced an ordering bug: tests were calling `bus.close()` *after* exiting `storage.attach`, but the drain task was already canceled at that point, so `run_finished` and late `task_finished` events never made it to disk. The test panicked with `RunStatus.RUNNING` when we expected `COMPLETED`. This is exactly the kind of bug the fault-injection test is designed to catch — the contract wasn't obvious, and now it's explicit. Fixed by closing the bus *inside* the `attach` context and documenting.
-- A `ClosedResourceError` leaked from the drain task when the context exited abruptly. Added `anyio.ClosedResourceError` to the drain's `except` tuple.
-
-**Test surface (3 new integration tests, 41 total):**
-
-- `test_storage_roundtrip` — run → persist → reload → equality on status, task ids, and scores.
-- `test_resume_skips_completed_and_matches_clean_run` — **the key M3 test.** Run 8 tasks with concurrency=2 and latency; trigger `stop_event` mid-run so only some complete; verify partial state persisted as `CANCELLED`; resume from the partial run; assert (1) no task scored twice, (2) all 8 tasks present, (3) resumed scores equal a fresh clean run's scores per-task.
-- `test_resume_on_already_complete_run_is_no_op` — resume a fully-complete run; no new work, same `run.id`, same tasks.
-
-**Gates:** ruff ✅, mypy --strict ✅, import-linter ✅ (30 files, 81 deps, 0 broken), pytest ✅ (41 passed). Coverage on core modules: **92.33%** (floor 90%).
-
-**What's next:** M4 — real provider adapters.
+**Why that framing?** Because the failure mode of evaluation tools today is not "not enough rubrics." It's "I can't trust the numbers because the harness crashed at task 847, I restarted, and now I don't know if task 500 was scored against the old prompt or the new one." We wanted to be the library the other libraries don't have to write.
 
 ---
 
-## M4 — Anthropic + OpenAI adapters, cost accounting, secret redaction
+## Q2: Why a library, not a service?
 
-**Built:**
+The spec says "library-first," but we had to decide what that actually means in code. We ended up with a hard rule:
 
-- `evalforge/providers/_http.py` — shared HTTP helpers. `translate_http_error` is where every third-party exception dies: `httpx.HTTPStatusError` for 429/5xx + connect/read timeouts/network errors become `ProviderTransientError`; all other 4xx become `ProviderPermanentError`. `require_env(name)` raises a `ProviderPermanentError` at construction time so missing keys surface *before* any request is issued, not deep inside a worker.
-- `evalforge/providers/anthropic.py`, `evalforge/providers/openai.py` — adapters built directly on `httpx`. **No vendor SDK dependency.** The spec's required deps do not mention `anthropic` / `openai`, and the thinner surface is easier to test. I use `httpx.MockTransport` in tests to stub responses at the wire boundary, which also guarantees we never accidentally hit a real endpoint.
-- `evalforge/providers/pricing.py` — per-million-token price table with `register_price(model, ModelPrice(in, out))`. Responses now populate `TokenUsage.cost_usd` from it. Pricing is intentionally **not** fetched from vendors: the price a run was billed at is a persistent property of the run, and historical runs shouldn't shift when vendor list prices change.
-- `evalforge/_logging.py` — `structlog` JSON pipeline. The key piece is `redact_secrets`, a processor that scrubs any `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` value from the record before encoding, **recursively** through nested dicts, lists, and tuples. Tests prove the key string never appears verbatim.
+> If you're writing business logic in `cli.py` or `server.py`, it belongs in the core.
 
-**Key decisions:**
+Every CLI command and every HTTP handler is five to fifteen lines. They do two things: marshal inputs, call a library function, marshal outputs. Nothing else.
 
-1. *No vendor SDKs.* Considered `anthropic` + `openai`. Rejected: (a) spec's required-deps list doesn't mention them, (b) both SDKs pin their own `httpx` / `pydantic` versions and would churn `uv.lock` on every vendor release, (c) test mocking is simpler when we control the HTTP surface. Cost: we're responsible for tracking schema changes. Accepted — the Messages / Chat Completions shapes are stable enough that this is fine.
-2. *Redaction is defense-in-depth.* Provider adapters don't log API keys in the first place; the `redact_secrets` processor is a safety net for cases where a user logs a full request dict from their own code. The test proves the net works even when a key is buried three levels deep in a list inside a dict.
-3. *Pricing as code, not config.* Considered a YAML file. Rejected: this way the prices are versioned with the code, and overrides are a function call, not a file edit. The `mock` model is registered at `(0.0, 0.0)` so mock-driven tests' token accounting zeros out cleanly.
-4. *Strict validation at the env boundary.* `AnthropicProvider()` / `OpenAIProvider()` read the env var at `__init__` and raise if it's missing. The alternative — lazy at first request — means a misconfigured production service would run a pipeline for minutes and only fail on the first provider call. Raising early is a much better error.
+**Why push so hard on this?** Two reasons.
 
-**Recovery moments:**
+First, the CLI and server are *examples of integration*, not the library. If you're a vendor who wants to embed eval orchestration into your own product, you shouldn't have to copy-paste from `cli.py` to reconstruct the logic. The library itself has to be the thing.
 
-- `mypy --strict` flagged `redact_secrets` as having the wrong signature for a `structlog` processor: it expected `MutableMapping[str, Any]` not `dict[str, Any]`. Fixed.
-- Ruff warned about `f"..."` strings with no interpolation in the redaction test — I was using `f""` just to keep the pattern consistent. Removed the `f` prefix.
-- Providers initially called `raise_for_status()` eagerly inside `json_or_raise`. That made the error translation code clumsy because I was catching `HTTPStatusError` in two places. Reorganized so the `try/except httpx.HTTPError` at the `post()` call site handles both network errors and bad statuses uniformly via `translate_http_error`.
+Second, thin adapters are testable in ways thick ones aren't. The `POST /runs` handler is trivially correct because it delegates to `load_suite` → `Engine.run` → `store.attach`. We don't need end-to-end integration tests for the server to catch bugs; unit tests on each of those library calls cover the behavior.
 
-**Test surface (11 new, 52 total):**
-
-- 8 provider tests: request shape + response parse per vendor, 429/4xx/5xx/network translation for Anthropic, network-error translation for OpenAI, refuses-to-construct without env key.
-- 3 redaction tests: key in a top-level string, key in a nested dict, and a no-secrets-present negative test (proves normal log lines still pass through unscathed).
-
-**Gates:** ruff ✅, mypy --strict ✅, import-linter ✅ (40 files, 105 deps), pytest ✅ (52 passed).
-
-**What's next:** M5 — CLI + FastAPI server as thin adapters.
+**What the alternative would have cost:** the CLI would have evolved argument-parsing quirks the library didn't know about. The server would have grown its own state management. Six months later, someone trying to embed the library would find a dozen subtly different ways of running a suite and would choose the wrong one.
 
 ---
 
-## M5 + M6 — CLI, server, end-to-end example
+## Q3: Why build the tooling before the code?
 
-**Built:**
+Before a single domain type was written, we had `pyproject.toml`, ruff, `mypy --strict`, `import-linter`, pre-commit, and CI configured and green on an empty package.
 
-- `evalforge/_loader.py` — imports a Suite object from a Python file path. Used by both CLI and server. Raises `ConfigurationError` with the specific path / attribute name when things don't line up.
-- `evalforge/cli.py` (Typer): `run`, `show`, `list`, `diff`. Every command is 5–15 lines and maps to one or two library calls. Emits structured JSON logs to stderr; prints the run id on stdout for shell piping.
-- `evalforge/server.py` (FastAPI): `POST /runs`, `GET /runs`, `GET /runs/{id}`, `GET /runs/{id}/events`. `create_app(db_path=...)` factory plus a module-level `app` for `uvicorn evalforge.server:app`. Lifespan context manages the storage connection. An `EvalforgeError` exception handler maps our taxonomy to HTTP status codes.
-- `examples/math_suite.py` — 4 math word problems with a solver → `[llm_judge("correctness"), rule_judge("is_digit")]` pipeline. Runs against the mock provider with scripted responses so anyone can `uv run evalforge run examples/math_suite.py` out of the box.
+**The question this answers is: what's the cost of being wrong?**
 
-**Key decisions:**
+If you write `types.py` first and then set up mypy later, you're going to find type errors. Some will be easy. Some will force you to redesign an interface. If you don't find them until after you've written `engine.py`, the redesign ripples through everything downstream. The work you already did is on shaky ground and you don't know it yet.
 
-1. *Factory over module-level app.* `create_app(db_path=...)` lets tests stand up isolated server instances with their own DBs, and lets the same code run against different databases in different environments. The module-level `app = create_app()` stays for the `uvicorn evalforge.server:app` case.
-2. *Server's SSE is historical replay.* Live streaming events off the in-memory bus to HTTP clients would require fanning out across multiple subscribers and managing backpressure per-client. I punted: `GET /runs/{id}/events` reads from the persisted `events` table. For runs in flight, the CLI / client can poll or re-request. Live fan-out is a follow-up — flagged, not forgotten.
-3. *CLI uses subprocess tests, server uses ASGI in-process.* The CLI test spawns a real subprocess to catch packaging / entry-point mistakes; the server test uses `httpx.ASGITransport` + `app.router.lifespan_context(app)` in-process so the tests stay fast.
-4. *The example is deliberately reproducible.* `install_mock_provider(script=[...])` at module scope means the example prints the same results every run. This is a documentation property: the README can claim "mean correctness 0.75, all 4 tasks pass is_digit" and it'll be true forever.
+The same logic applies to the import-linter architecture contract. Writing the contract *first* means the first import you ever write is checked. You never build up a mountain of violations that you have to choose between fixing or suppressing.
 
-**Recovery moments:**
-
-- FastAPI `@on_event("startup")` is deprecated in 0.111+. My `filterwarnings = ["error"]` in `pytest.ini` turned that into a hard test failure on first run — which is exactly what the filter is for. Migrated to `lifespan` context managers.
-- Ruff's SIM117 (combine `with` statements) flagged my nested `async with AsyncClient(...) as c: async with app.router.lifespan_context(app):` pattern. Combined into a parenthesized multi-context form.
-
-**End-to-end proof:** ran `uv run evalforge run examples/math_suite.py` in a scratch directory; got a run id back, saw `mean_scores: {"correctness": 0.75, "is_digit": 1.0}` in the final log line, and `evalforge list` showed the persisted row.
-
-**Test surface (3 new, 55 total):**
-
-- `test_example_suite_runs` — the example runs end to end through the real engine.
-- `test_cli_run_command` — subprocess tests of `evalforge run`, `evalforge show`, `evalforge list` against an isolated SQLite DB.
-- `test_server_lifecycle` — ASGI in-process test of `POST /runs`, `GET /runs/{id}`, `GET /runs`, covering the full lifespan handler pair.
-
-**Gates:** ruff ✅, mypy --strict ✅, import-linter ✅ (45 files, 139 deps, 0 broken), pytest ✅ (55 passed). Core coverage: **92.33%** (floor 90%).
+**The concrete payoff in this session:** when we wrote `types.py`, the import-linter contract already forbade it from importing anything else in the project. It could not accidentally reach for `httpx` or `sqlalchemy`, even as a convenience. The clean layer wasn't something we maintained — it was something the tooling made impossible to violate.
 
 ---
 
-## M7 — Polish
+## Q4: Why frozen Pydantic models for the domain?
 
-**Built:** fleshed-out README (quickstart, architecture, error taxonomy, public API surface, server doc, development gate list), tagged v0.1.0 in the CHANGELOG, finalized this session log.
+The spec mandated this, but it's worth articulating why the mandate is correct. It's load-bearing.
 
-**What was built across the session:**
+**Mutation breaks the event stream.** If `TaskResult` is mutable and the engine publishes a `task_finished` event containing `result`, a subscriber reading that event ten milliseconds later might see a different object than what was published. With frozen models, the event is a snapshot by construction. You can ship it over SSE, stuff it in JSON, read it back a week later — it's still the same bytes.
 
-| Module                      | LOC  | What it is |
-|-----------------------------|------|------------|
-| `types.py`                  | ~300 | Frozen Pydantic v2 domain (Task, Score, Run, TaskResult, Event, …) |
-| `errors.py`                 |  ~85 | EvalforgeError hierarchy with structured context |
-| `pipeline.py`               | ~260 | Nested-list declaration → `ResolvedDAG`; `Suite` with eager compile |
-| `agents.py`                 | ~320 | Agent/Judge protocols; `llm_agent`/`llm_judge`/`rule_judge` factories |
-| `events.py`                 | ~160 | `EventBus` with per-subscriber bounded streams; monotonic seq |
-| `engine.py`                 | ~400 | DAG walker, task-level semaphore, per-node seeded retry, event emission |
-| `storage/sqlite.py`         | ~400 | sqlite3 + WAL via `anyio.to_thread`; transactional task writes; `attach(bus)` |
-| `storage/migrations/001_initial.sql` | ~60 | Schema: runs / task_results / scores / events |
-| `providers/anthropic.py`, `providers/openai.py` | ~225 | `httpx`-based adapters with error translation |
-| `providers/pricing.py`      |  ~55 | Pluggable per-model pricing table |
-| `_logging.py`               |  ~85 | structlog pipeline + recursive secret redaction |
-| `_loader.py`                |  ~45 | Load Suite from a .py file path |
-| `cli.py`                    | ~140 | Typer: `run`, `show`, `list`, `diff` |
-| `server.py`                 | ~165 | FastAPI with lifespan; `POST /runs`, `GET /runs[/{id}[/events]]` |
-| `examples/math_suite.py`    |  ~70 | Runnable end-to-end suite against the mock |
+**Mutation breaks storage.** `save_task_result(run_id, result)` serializes the result into SQLite. If the caller mutates `result` after the call, the in-memory copy and the on-disk copy diverge silently. Frozen models plus Pydantic's `extra="forbid"` mean: every `TaskResult` that reaches storage is exactly the `TaskResult` the engine produced.
 
-**Final gates, all green:**
-- 55 tests (26 unit + 12 integration + 17 provider/redaction/pipeline) under `pytest-randomly` ordering.
-- `ruff check` + `ruff format --check` clean.
-- `mypy --strict` on `evalforge/`: 19 source files, 0 errors, 0 `# type: ignore` that isn't justified.
-- `import-linter`: both the layered-architecture contract and the types/errors-as-leaves contract KEPT.
-- Core-module coverage: **92.33%** (floor 90%).
-- CI runs the exact same sequence on Python 3.11 and 3.12.
+**Mutation breaks testing.** `result.model_copy(update={...})` is syntactically noisier than `result.status = "ok"`. It's also the reason we can write:
 
-**What I'm proud of in this session:**
-- The event bus as the single source of truth. Storage literally cannot diverge from the engine's idea of the world because it derives everything from the stream.
-- The fault-injection resume test. It's the test I would've wanted as a skeptic reading the spec.
-- `import-linter` catching dependency-direction drift at CI time, not at code-review time.
-- The provider adapters having zero vendor SDK dependency. Smaller surface, faster tests, easier to maintain.
+```python
+assert resumed_by_id[tid].scores == clean_by_id[tid].scores
+```
 
-**What I'd do next with more time:**
-- Live SSE streaming off the active bus (currently replays from storage).
-- Caching — memoize `(agent_id, task_id, input_hash, agent_version)` tuples so rubric-only re-runs are cheap. Noted as a stretch goal in the spec.
-- Per-agent concurrency override (spec allows it; current code respects only the Suite-level knob).
-- A browser UI at `GET /runs/{id}/ui`.
+and trust it. If scores were a mutable list and a test elsewhere appended to it, this comparison would be a time-traveling hazard. Frozen containers + tuples make the test a real assertion instead of a hopeful one.
 
-v0.1.0 is tagged. CI is green on every push. The library is something I'd onboard a junior engineer to tomorrow.
+**What it costs:** a little verbosity (`.model_copy(update=...)` instead of attribute assignment) and the need for `object.__setattr__` in the one place `Suite` caches its compiled DAG. We decided that cost is tiny compared to the certainty we buy.
 
+---
 
+## Q5: Three error categories. Why not two, or five?
+
+The categories are `TransientError`, `PermanentError`, `FatalError`. The question is: what makes this the right partition?
+
+The partition is driven by **engine behavior**, not by origin. That's the key insight. We don't classify errors by *what kind of thing went wrong* — we classify them by *what the engine should do when it sees one*.
+
+- `TransientError` → retry with backoff. This is the only category the retry loop ever catches.
+- `PermanentError` → mark this task failed, let the run continue. A 4xx from the API, a schema violation, a missing template variable — all the same to the engine: give up on this task, keep going.
+- `FatalError` → abort the whole run. Storage is unavailable, an invariant is violated, the process cannot make forward progress safely.
+
+**Why not combine `Permanent` and `Fatal`?** Because the blast radius matters. A single task hitting a `PermanentError` should not end the run — you still want scores for the other 999 tasks. A corrupted storage file should end the run, because continuing would produce data you can't trust.
+
+**Why not split `Transient` into rate-limit vs. server-error vs. network?** We considered this. The argument for splitting is that you might want different backoff strategies per cause. The argument against is that the retry loop doesn't actually need to know the cause — it needs to know "is it worth trying again?". The specific cause lives in `error.context` for debugging; the category drives behavior. Keeping categories minimal means fewer places in the codebase have to know about them.
+
+**Provider errors get a subtype each** (`ProviderTransientError`, `ProviderPermanentError`). This is where the taxonomy meets the provider boundary. The rule: a provider translates its native exception (httpx status code, connection error) into one of these two before the error leaves `complete()`. User code never sees `httpx.HTTPError`. This is a hard invariant — it's what makes the retry loop sound.
+
+---
+
+## Q6: Why this pipeline DSL?
+
+The user writes:
+
+```python
+pipeline=[
+    llm_agent("solver", ...),                               # stage 0
+    [llm_judge("correctness", ...), rule_judge("format", ...)],  # stage 1, parallel
+]
+```
+
+We considered three alternatives and picked this one.
+
+**Alternative A: Explicit DAG builder.**
+
+```python
+solver = Node(...)
+judge_a = Node(...).after(solver)
+judge_b = Node(...).after(solver)
+pipeline = DAG([solver, judge_a, judge_b])
+```
+
+Pros: totally explicit, arbitrary topologies. Cons: four lines to express what the nested list does in two, and the `.after(...)` plumbing leaks into user code. Rejected.
+
+**Alternative B: Decorator graph.**
+
+```python
+@stage(0)
+def solve(task): ...
+
+@stage(1, parent="solve")
+def judge(task, output): ...
+```
+
+Pros: feels Pythonic. Cons: "Pythonic" here is code smell — we'd be inventing a decorator DSL that Python's import machinery then has to make sense of. Rejected.
+
+**Alternative C: Nested list (chosen).**
+
+Pros: the structure of the declaration mirrors the structure of the execution. You read it top-to-bottom and that's the order it runs. A nested list is "run in parallel here." No imports needed, no special terms, no `.after()` calls.
+
+The cost is that fan-in is awkward — if two agents feed into one judge, the judge has to disambiguate with `parent="solver_a"`. We decided that cost is acceptable because fan-in is rare (the common case is one solver, many judges) and because the error at compile time is crisp when you get it wrong.
+
+**Why we validated aggressively at compile time.** The `compile_pipeline` function rejects empty pipelines, duplicate node IDs, judge-only first stages, and fan-in-without-disambiguation. All of these could be caught at runtime with a panic, but the user experience is dramatically better when `Suite(...)` fails at import time with a pointer to the exact problem. A failed run at task 500 because of a pipeline-wiring bug is the worst possible outcome — you've already paid for 500 LLM calls and the error could have been caught before any code ran.
+
+---
+
+## Q7: Why compile the DAG eagerly at `Suite` construction?
+
+The pattern is:
+
+```python
+suite = Suite(name="...", tasks=[...], pipeline=[agent, [judge_a, judge_b]])
+# If this line returns, the pipeline is valid.
+```
+
+The alternative is lazy compilation: build the `ResolvedDAG` on the first call to `engine.run(suite)`.
+
+**Why eager wins.** The point of a `Suite` is to be a declaration. A declaration that is syntactically valid but semantically broken is worse than a declaration that throws immediately. With eager compilation, the user's suite file either imports cleanly or it doesn't; there's no "this looks fine but will blow up in production" state.
+
+There's also a secondary benefit: the compiled DAG is available for inspection (`suite.dag.topo_order()`, `suite.dag.judges()`) *before* a run starts. This makes it easy to write pre-flight tooling that checks a suite's shape without executing it.
+
+**The cost is a slightly unusual `__init__`.** `Suite` extends Pydantic's `BaseModel` but does compilation in its own `__init__` override, then caches the `ResolvedDAG` via `object.__setattr__` because frozen models don't let you assign to properties normally. We disliked this enough to make it one of three places in the codebase that uses the escape hatch — but the user experience is worth it.
+
+---
+
+## Q8: How did we decide the event bus semantics?
+
+This was the most architecturally load-bearing decision in the whole library. Get it wrong and either the engine is slow, or events drop silently, or subscribers race each other. We weighed three options:
+
+| Option | Description | Back-pressure | Multi-subscriber | Verdict |
+|--------|-------------|---------------|------------------|---------|
+| A | Single bounded queue + background distributor task | Yes (one lock point) | Yes (distributor fans out) | More moving parts, same outcome |
+| B | Per-subscriber bounded `anyio` memory object streams, publisher fans out | Yes (publisher blocks per sub) | Yes | **Chosen** |
+| C | Callback list (no streams) | **No — callbacks block publisher, or drop if async-scheduled** | Yes | Silent event loss possible |
+
+The decision comes down to what we believe about the relationship between the publisher and the slowest subscriber.
+
+We believe: **a subscriber that can't keep up should throttle the publisher**, not drop events. The classic example: storage is SQLite, SQLite is synchronous, SQLite is sometimes slower than the engine can publish. If we drop events under pressure, storage's view of the run diverges from the engine's view of the run. Resume becomes unsound. That's a correctness bug disguised as a performance optimization.
+
+So: back-pressure, always. The publisher blocks if any subscriber's buffer is full. The engine runs no faster than its slowest observer. This is exactly the property we want — it means the subsystem that's trying to keep up with the truth always can.
+
+**Why per-subscriber streams specifically?** Because fan-out under a single queue requires a distributor task, which means one more concurrent actor in the system, which means one more potential deadlock site. With per-subscriber streams, the publisher iterates the subscriber list once under a lock (for `seq` assignment) then fans out. It's about 40 lines of code total. The simpler thing that works.
+
+**Monotonic `seq` is authoritative at the bus.** We stamp `seq` on publish, overwriting whatever the caller put there. Having two sources of truth for event ordering is how you end up debugging why your audit log is non-sequential at 2am.
+
+---
+
+## Q9: Why is storage a subscriber and not a direct dependency?
+
+The spec says "Storage is a subscriber, not a dependency of the engine." We enforced this literally: `engine.py` has zero imports from `storage/`. The import-linter contract makes it impossible to add one.
+
+**Why the hard line?**
+
+If the engine calls `storage.save_task_result(...)` directly, then:
+
+- Every test of the engine has to stub or provide storage.
+- Storage becomes part of the engine's failure surface. A storage hiccup becomes a task failure.
+- A future "in-memory" storage, or "ship results to S3" storage, or "skip storage entirely" mode requires changes to the engine.
+- The event stream and the persisted state can drift. What if the engine saves to storage but fails to publish the event? Or vice versa? Every consistency bug between observable state and persisted state has to be audited.
+
+When storage is a subscriber:
+
+- The engine has one output: events. Tests of the engine just collect events.
+- Storage is optional. Run without it for experiments; add it for production.
+- Any other subscriber (metrics aggregator, live dashboard, SSE relay) gets equal standing with storage.
+- There is exactly one source of truth: the event stream. Persisted state is derived from it.
+
+**The cost of this decision.** Events have to carry enough information to reconstruct state. `task_finished` events include the full serialized `TaskResult` in their payload. That's a few hundred bytes per task. For a 10,000-task run, that's 2 MB of event payload — negligible on any modern storage, but worth noting.
+
+**The payoff.** `storage.attach(bus)` is 30 lines. It subscribes, reads events, applies them. That's the entire coupling. A second storage backend would be another 30 lines, zero changes to the engine.
+
+---
+
+## Q10: What made us confident resume is correct?
+
+Resume is the feature that either makes the library trustworthy or makes it a liability. A resumed run that produces subtly different results than a clean run is the worst kind of bug — it'll be found by a user six months later, on a run they can't reproduce.
+
+We reasoned about correctness in two steps.
+
+**Step one: the invariants.** We wrote them down before writing the test:
+
+1. No task is scored twice across (original + resumed) runs.
+2. No task is silently dropped.
+3. A resumed run's results equal a clean run's results on the same seed.
+
+**Step two: the mechanism that makes each invariant true.**
+
+*Invariant 1 (no double-scoring).* Storage writes each `TaskResult` transactionally on `task_finished`. The engine, on resume, calls `run.completed_task_ids` which pulls from storage, then filters `pending = [t for t in suite.tasks if t.id not in completed]`. A task can only appear in `pending` if its `ok` row is absent from storage. Mechanism: atomic commit + set difference.
+
+*Invariant 2 (nothing dropped).* Every task in the suite is either in `completed_ids` (already done) or in `pending` (about to run). The union is exhaustive by construction — both sets come from `suite.tasks` via a membership test. Mechanism: partition of a set is a partition.
+
+*Invariant 3 (seed-equality).* The engine's only sources of randomness are (a) LLM calls (which the mock provider makes deterministic in test) and (b) retry jitter (which is seeded on `hash((run.seed, task.id, node.id, attempt))`). A resumed run uses the same seed as the original. Therefore any task re-run on resume sees the same deterministic jitter sequence as it would in a clean run. Mechanism: pure function of seed.
+
+**Then we wrote the test that tries to break it.** The fault-injection test kicks off eight tasks with concurrency=2 and 50ms latency per task, triggers `stop_event` at 70ms so some tasks complete and some don't, persists the partial run, resumes it, and verifies all three invariants hold. It also runs the suite cleanly and asserts per-task score equality with the resumed run.
+
+This is the test we'd want to see as a skeptical reader. It's the test that turned resume from "I think it works" into "I know it works."
+
+---
+
+## Q11: Why task-level concurrency rather than node-level?
+
+The engine has a semaphore that bounds how many *tasks* are in flight concurrently. Within a task, fan-out at a DAG layer is unbounded (naturally capped by stage width).
+
+**We considered node-level scheduling.** Treat every DAG node for every task as a schedulable unit, throw them all at a worker pool.
+
+Two reasons we didn't:
+
+1. **It doesn't match how users think.** A user who says `concurrency=8` is thinking "I want eight problems being worked on at once." They're not thinking about the distinction between solver invocations and judge invocations. Task-level concurrency gives them exactly that mental model.
+
+2. **Node-level scheduling adds bookkeeping.** You have to track which nodes are ready (parents done), which are running (for back-pressure), which are blocked (parents pending). You have to handle the case where two tasks need the same judge, and one is pre-empted by the other. It's not hard, but it's extra code with extra edge cases, and the only payoff is better utilization in a pathological case (one very expensive judge feeding many cheap tasks) that we don't have evidence of.
+
+The task-level approach is: each task walks its own DAG, waits for its own judges, commits its own result. If you want more throughput, raise the semaphore. If you want less, lower it. One dial.
+
+**What we'd do later.** If a user hits a real bottleneck — a judge that's 100× slower than its siblings — the right fix is a per-agent semaphore, not a restructured scheduler. We sketched the shape of it mentally but didn't build it; no test exercises it and YAGNI.
+
+---
+
+## Q12: Why retry at the node, not the task?
+
+Consider: a task has a solver, then a correctness judge, then a style judge. The style judge gets rate-limited. What happens?
+
+With **task-level retry**: the whole task re-runs. The solver fires again (another LLM call you paid for). The correctness judge fires again (another LLM call). The style judge fires again (and maybe still rate-limited).
+
+With **node-level retry** (chosen): the style judge re-runs. The solver and correctness judge's results are reused from this task's run. One extra LLM call, not three.
+
+The payoff scales with pipeline depth. For a two-stage pipeline the waste is tolerable; for a five-stage pipeline it's catastrophic. Task-level retry would burn LLM budget every time a sixth-stage judge flakes.
+
+**The subtle requirement this creates.** Each node's retry loop has to know it's idempotent with respect to the upstream state. In practice this is fine — agent/judge calls are stateless to their inputs — but if you had side-effecting nodes (writing to a DB, sending a webhook) you'd need to think harder. We don't, today, have such nodes; the design leaves room to add an `idempotent: bool` flag on the protocol if we ever do.
+
+**Jitter is seeded.** The RNG is `random.Random(hash((run.seed, task_id, node_id, attempt)))`. Four facts matter here:
+- `run.seed` is constant across a run → same run, same jitter.
+- `task_id` + `node_id` → different tasks / different nodes get uncorrelated jitter.
+- `attempt` → each retry gets fresh jitter (so two retries aren't in lockstep).
+- `hash(...) & 0xFFFFFFFF` → fits in the 32-bit seed Python's `Random` accepts.
+
+Deterministic on purpose; uncorrelated on purpose. That's the sweet spot.
+
+---
+
+## Q13: Why no vendor SDKs for Anthropic / OpenAI?
+
+We use `httpx` directly. The spec's required-deps list did not include `anthropic` or `openai` SDKs, which was a signal, but the real reasoning is architectural.
+
+**SDK dependencies have their own universes.**
+
+The `anthropic` SDK pins its own `httpx` version. So does `openai`. So does `fastapi` (transitively). If you have all three, the resolver has to find a single `httpx` version all three accept. That's fine until one of them releases a breaking change and the resolver can't find a solution without downgrading another.
+
+Our stance: we speak the HTTP protocol. The HTTP protocol is stable. Anthropic's Messages API and OpenAI's Chat Completions API are stable at the wire level — they've been stable for years. We write maybe 80 lines per vendor to translate requests and responses. In exchange we have zero transitive dependency churn.
+
+**Testing gets easier.** `httpx.MockTransport` lets us intercept every request with a handler function. The test file for the providers exercises:
+- request shape (payload, headers, URL),
+- response parsing (text, token counts, finish reason),
+- error translation for 429, 4xx, 5xx, network errors,
+- construction-time failure when env vars are missing.
+
+None of this uses `unittest.mock` or SDK internals. It's all behavior at the HTTP boundary. If Anthropic ships a new field tomorrow, we won't get surprise behavior changes from an SDK update we didn't audit.
+
+**What we give up.** Retry middleware, streaming helpers, tool-use helpers, and whatever clever thing the SDK teams ship next month. For this library's purpose — single-shot completions with token accounting — we don't need any of it. If a user does, they can wrap our `Provider` protocol around a SDK client; the protocol is eight lines.
+
+---
+
+## Q14: Why is secret redaction a correctness test, not a code review concern?
+
+The test proves: set `ANTHROPIC_API_KEY=sk-ant-xxx`, emit a log line that contains the key, assert the rendered output doesn't contain `sk-ant-xxx`.
+
+We could have just said "don't log secrets." Instead we built a structlog processor that walks every record (including nested dicts, lists, tuples) and replaces any known-secret substring.
+
+**Why the belt-and-suspenders?**
+
+Provider adapters don't log keys. That's rule one, enforced by review. But:
+
+- Users write their own code on top of the library. They might log a request dict that happens to contain a header.
+- Exception traces can include argument values from frames. A `repr(request)` that happens to include an auth header ends up in a log.
+- `structlog` renders the whole event dict. Everything bound via `log.bind(...)` is a candidate for rendering.
+
+The processor means: however a secret ends up in the event dict, it can't make it to the rendered output. The test proves this for direct strings, nested dict values, and list items — the three ways a secret could travel.
+
+**This is the kind of invariant that belongs in code, not in checklists.** A code-review rule depends on the reviewer catching every case forever. A processor + a test catches every case now and forever. The ROI on twenty lines of code is enormous.
+
+---
+
+## Q15: How did we keep the layered architecture honest?
+
+The module order in the spec is prescribed:
+
+```
+types / errors  →  events  →  providers  →  agents  →  pipeline  →  storage  →  engine  →  cli / server
+```
+
+Modules may only import from modules below them. Violations fail CI.
+
+**We enforced this with `import-linter` contracts in `pyproject.toml`.** Two contracts:
+
+1. A `layers` contract listing the exact module order. Any cross-layer import fails.
+2. A `forbidden` contract explicitly naming `types` and `errors` as true leaves: they may not import anything else in the project, and may not import `httpx`, `sqlalchemy`, `fastapi`, or `typer`.
+
+**Why the second contract is necessary when the first exists.** The layers contract prevents `types.py` from importing `pipeline.py`. It doesn't prevent `types.py` from importing `httpx`. Separately forbidding external libraries at the leaf layer means `types.py` *stays* a leaf at the library-dependency level, not just the intra-package level. The day someone writes `from httpx import URL` into `types.py` because it's convenient, CI fails and the PR can't merge.
+
+**The payoff.** We never had to think about layer violations after M0. We wrote the code, and if we accidentally reached upward, CI told us at the next push. The architecture is not a convention maintained by good intentions; it's a property the tooling will not let us break.
+
+**Consequence.** When writing `engine.py`, we had to serialize `TaskResult` into event payloads because the engine couldn't call storage directly. This felt awkward for a minute — it's strictly more code than just calling `storage.save(result)`. Then we realized: this is the force function that keeps the event stream complete. The constraint isn't an annoyance; it's the thing driving the design to be sound.
+
+---
+
+## Q16: Where did we hit real friction, and how did we climb out?
+
+Five moments in the session where the design or the implementation pushed back. The log in git will show these as small back-and-forth commits; the lesson in each is worth preserving.
+
+### 16a. The event bus teardown dance
+
+**Problem:** First fault-injection test failed because `run_finished` events never reached storage. The `attach` context was exiting before the drain task had processed the buffer.
+
+**The wrong instinct:** close the subscriber stream in `__aexit__` so the drain task exits. This is what I wrote first. It's wrong because `stream.aclose()` on the receive side discards pending events.
+
+**The right model:** the drain task only exits cleanly on `EndOfStream`, which only fires when the *send* side closes — i.e., when the *bus* is closed. So the contract became: close the bus before exiting the storage context. The context's `__aexit__` waits for the drain task's task group to complete, which happens naturally once the bus is closed.
+
+**The lesson:** when async teardown feels off, ask "who is signaling 'done' to whom?" — and make sure the close direction matches the data-flow direction.
+
+### 16b. B023: loop-captured closures
+
+**Problem:** ruff flagged `_run_node_in_layer` defined inside `for layer in dag.layers:` as capturing loop-varying locals (`layer_lock`, `layer_outputs`).
+
+**Why it was actually fine today but wrong tomorrow:** the closure only ran inside the same iteration's `async with anyio.create_task_group()` block, so it captured the current iteration's locals. But that invariant wasn't visible in the code — any future refactor that deferred the tasks across iterations would silently break it.
+
+**The fix:** extract `_run_layer` as a method taking `layer`, `outputs`, etc., as explicit parameters. Cleaner, passes the linter, survives any future edit.
+
+**The lesson:** ruff's style checks aren't always style. Some of them encode invariants that your code depends on without saying so.
+
+### 16c. mypy and variance in union types
+
+**Problem:** `tuple(stage)` where `stage: Agent | Sequence[Agent]` returned `tuple[Agent | Sequence[Agent]]` — not the `tuple[Agent, ...]` we wanted.
+
+**Why:** mypy doesn't narrow element types through `isinstance(stage, (list, tuple))`. The narrowed type is `list | tuple`, not `list[Agent] | tuple[Agent, ...]`. So the element type stays the union.
+
+**The fix:** annotate `items: list[Agent] = list(stage)` in the list/tuple branch, and `single = cast(Agent, stage)` in the single-node branch. The cast is honest — we've already verified `hasattr(stage, "id") and hasattr(stage, "run")`.
+
+**The lesson:** when mypy surprises you on a generic type, the fix is usually an explicit annotation at the point where the type is "obvious" to the reader. The cast isn't a workaround; it's the proof that the runtime check we already wrote is complete.
+
+### 16d. FastAPI's `on_event` deprecation
+
+**Problem:** We used `@app.on_event("startup")`. FastAPI 0.111+ issues a `DeprecationWarning`. Our pytest config has `filterwarnings = ["error"]`. First server test failed.
+
+**Why we had `filterwarnings = ["error"]` in the first place:** because deprecation warnings in tests rot quietly. They stop being warnings and start being errors when the library ships a breaking change, and by then you're on the critical path. Treating them as errors now means you pay the migration cost in small increments.
+
+**The fix:** migrate to the `lifespan` context-manager pattern. Five lines.
+
+**The lesson:** `filterwarnings = ["error"]` is one of the highest-ROI two lines of config you'll ever write.
+
+### 16e. Coverage script filename mismatch
+
+**Problem:** First run of `scripts/check_core_coverage.py` against `coverage.xml` reported "no core lines counted" — the script was matching `evalforge/types.py` but the XML reported `types.py` (stripped prefix).
+
+**The subtle issue:** `coverage.py` uses package-relative paths, not workspace-relative paths. The `<package>` elements in the XML have `name="."`, `name="providers"`, `name="storage"` — and the classes inside use filenames relative to the package.
+
+**The fix:** match on the `filename` attribute, which is `types.py` (or `storage/sqlite.py`), not `evalforge/types.py`.
+
+**The lesson:** every tool has its own idea of what "path" means in its output format. Assume the format; verify with a 30-second script that prints what it actually sees.
+
+---
+
+## Q17: What did we deliberately not build?
+
+A partial list, each with reasoning:
+
+- **Per-agent concurrency override.** Suite-level `concurrency` is the one dial today. An agent with a tight rate limit could benefit from its own semaphore, but no test exercises it and no user has asked. Adding it later is additive — no existing test breaks.
+- **Live SSE streaming from an in-flight run.** `GET /runs/{id}/events` replays from storage. Fan-out from the live bus to HTTP clients requires per-connection subscribers and their own buffer management; it's more complex than the core and can land when real users need it.
+- **Output caching by `(agent_id, task_id, input_hash)`.** Flagged as a stretch goal in the spec. The caching key needs to include the agent's version / prompt hash, or stale cache hits become a correctness bug. We wanted the first version to be simple and trustworthy; caching goes in version two.
+- **Result diffing UI.** `evalforge diff` prints per-task score deltas to the terminal. A side-by-side HTML view would be nicer. It's a stretch goal; the CLI text form is sufficient for the spec's acceptance criteria.
+- **Signal handlers inside the engine.** `Engine.run` takes an `anyio.Event` stop signal. Production code that wants real SIGINT handling wires `anyio.open_signal_receiver` to flip the event. We kept the signal mechanism out of the engine itself so tests don't have to send real signals to verify shutdown behavior — and so the library composes into processes that already have their own signal policy.
+- **Retry policies expressed as predicates.** Each retry policy is a simple `(max_retries, base_backoff, max_backoff, jitter)` tuple. A richer form (retry on specific error contexts, custom backoff curves) would be straightforward to add; none of our scenarios demanded it.
+
+Each of these is a door we left unlocked but didn't walk through. That was a conscious choice — every additional abstraction is a cost paid by every future reader.
+
+---
+
+## Q18: If someone forked this tomorrow, where would they struggle?
+
+Honest answer, three places.
+
+**1. The `Suite.__init__` escape hatch.** Frozen Pydantic models are usually immutable, but `Suite` caches its compiled `ResolvedDAG` via `object.__setattr__` because the compilation depends on runtime agent instances, not on the Pydantic validator's input. A reader coming to `suite.py` cold will find that surprising. We commented it and kept it to one place. If pydantic ships proper `cached_property` support for frozen models, we'd migrate immediately.
+
+**2. The event-payload-as-carrier pattern for storage.** The engine publishes `run_started` with the full `Run` serialized inside the payload, and `task_finished` with the full `TaskResult`. This is how storage reconstructs state from events alone. A reader might initially think "why not just have the engine call storage?" — the answer is in Q9 above, but it's not visible in the code. We considered adding a dedicated `Event.result: TaskResult | None` field instead of stuffing it in the payload dict; we preferred the payload dict because it keeps `Event` narrow and typed.
+
+**3. `storage.attach(bus)` bus-close semantics.** The caller has to close the bus inside the `attach` context, or the drain task won't exit cleanly. We documented this, and `attach` closes the bus itself as a safety net if the caller forgot. A reader who assumes "context-managed resources close themselves" will be mildly surprised. It's the correct behavior (the alternative discards buffered events), but the mental model takes a minute to load.
+
+---
+
+## Milestone recap
+
+| M | What was built | Gates | Tests (cumulative) |
+|---|----------------|-------|---------------------|
+| M0 | Tooling: `pyproject.toml`, ruff, `mypy --strict`, `import-linter`, pre-commit, GitHub Actions CI. Empty package with smoke test. | ✅ | 1 |
+| M1 | Frozen Pydantic domain types; `EvalforgeError` hierarchy; `Agent`/`Judge` protocols and factories; `compile_pipeline` → `ResolvedDAG`; `Suite` with eager compile. | ✅ | 28 |
+| M2 | `EventBus` with per-subscriber bounded streams; `MockProvider`; the execution engine with bounded concurrency, per-node retry, seeded jitter, graceful shutdown via stop-event. | ✅ | 38 |
+| M3 | `Storage` Protocol; `SQLiteStorage` with WAL, transactional task writes, migration runner; event-driven persistence via `storage.attach(bus)`; fault-injection resume test proving the three resume invariants. | ✅ | 41 |
+| M4 | `AnthropicProvider` and `OpenAIProvider` (built directly on httpx, no vendor SDK); HTTP error translation at the boundary; pluggable pricing table; `structlog` pipeline with recursive secret redaction. | ✅ | 52 |
+| M5 + M6 | `_loader.load_suite`; Typer CLI (`run`, `show`, `list`, `diff`); FastAPI server with lifespan, `POST /runs`, `GET /runs`, `GET /runs/{id}`, `GET /runs/{id}/events`; `examples/math_suite.py` runnable against the mock. | ✅ | 55 |
+| M7 | README, CHANGELOG (v0.1.0 tagged), this session log. | ✅ | 55 |
+
+---
+
+## Final state
+
+- **55 tests**, ~2s total under `pytest-randomly` ordering.
+- **mypy --strict**: 19 source files, 0 errors, 0 unjustified `# type: ignore`.
+- **ruff check + format**: clean.
+- **import-linter**: 45 files, 139 dependencies analyzed, both contracts (layered architecture + types/errors as leaves) KEPT.
+- **Core coverage**: 92.33%, floor is 90%.
+- **CI matrix**: Python 3.11 and 3.12, same gate sequence.
+- **7 commits on `main`**, one per milestone boundary, each commit green.
+
+The library is what the spec asked for. More importantly, the reasoning behind what the spec asked for is preserved here — in a form that a future maintainer can challenge, revise, or build on.
+
+If the question a reader brings to this repo is "why is it shaped this way?", this document is the answer.
